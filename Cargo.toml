@@ -80,6 +80,15 @@ wiremock = "=0.6.2"
 version = "0.3"
 optional = true
 
+# wasm32-only SystemTime shim. std::time::SystemTime::now() panics on
+# wasm32-unknown-unknown ("time not implemented on this platform").
+# `web-time` re-exports std::time on native and backs it with
+# js_sys::Date::now() on wasm32 — drop-in replacement, no API change at
+# the call site. Used by `proto_wallet::get_iso_timestamp` which feeds
+# `reveal_counterparty_key_linkage`'s revelation_time field.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+
 [features]
 default = ["primitives", "script"]
 primitives = []

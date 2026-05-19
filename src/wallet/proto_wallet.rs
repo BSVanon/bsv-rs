@@ -663,6 +663,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn get_iso_timestamp() -> String {
     // Simple timestamp without chrono dependency
     // Format: "2024-01-01T00:00:00.000Z"
+    //
+    // wasm32 portability: `std::time::SystemTime::now()` panics on
+    // `wasm32-unknown-unknown` (no platform impl). `web-time` re-exports
+    // `std::time` on native and backs it with `js_sys::Date::now()` on
+    // wasm32 — drop-in replacement.
+    #[cfg(target_arch = "wasm32")]
+    use web_time::{SystemTime, UNIX_EPOCH};
+    #[cfg(not(target_arch = "wasm32"))]
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
