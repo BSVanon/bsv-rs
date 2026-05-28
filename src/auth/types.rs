@@ -391,8 +391,15 @@ impl RequestedCertificateSet {
 
 /// Returns current time in milliseconds since Unix epoch.
 pub fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
+    // implemented on this platform"). `web-time` re-exports std on native and is
+    // backed by `js_sys::Date::now()` on wasm — drop-in, same API.
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(target_arch = "wasm32")]
+    use web_time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }

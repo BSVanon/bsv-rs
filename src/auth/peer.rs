@@ -676,12 +676,23 @@ impl<W: WalletInterface + 'static, T: Transport + 'static> Peer<W, T> {
         // Send the request
         self.transport.send(&msg).await?;
 
-        // Wait for response with timeout
-        let timeout = max_wait_time.unwrap_or(30000);
-        let result = tokio::time::timeout(tokio::time::Duration::from_millis(timeout), rx)
-            .await
-            .map_err(|_| Error::AuthError("Handshake timeout".into()))?
-            .map_err(|_| Error::AuthError("Handshake cancelled".into()))??;
+        // Wait for response with timeout.
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = {
+            let timeout = max_wait_time.unwrap_or(30000);
+            tokio::time::timeout(tokio::time::Duration::from_millis(timeout), rx)
+                .await
+                .map_err(|_| Error::AuthError("Handshake timeout".into()))?
+                .map_err(|_| Error::AuthError("Handshake cancelled".into()))??
+        };
+        // wasm32 has no tokio timer driver; the browser's fetch governs the
+        // request deadline, so we just await the oneshot directly.
+        #[cfg(target_arch = "wasm32")]
+        let result = {
+            let _ = max_wait_time;
+            rx.await
+                .map_err(|_| Error::AuthError("Handshake cancelled".into()))??
+        };
 
         Ok(result)
     }

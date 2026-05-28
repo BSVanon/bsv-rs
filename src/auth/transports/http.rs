@@ -17,7 +17,6 @@
 
 use crate::auth::types::AuthMessage;
 
-#[cfg(feature = "http")]
 use crate::auth::types::MessageType;
 use crate::{Error, Result};
 use async_trait::async_trait;
@@ -470,11 +469,31 @@ fn write_varint(value: i64) -> Vec<u8> {
 pub struct SimplifiedFetchTransport {
     /// Base URL of the remote server.
     base_url: String,
-    /// HTTP client (only available with `http` feature).
-    #[cfg(feature = "http")]
+    /// HTTP client. `reqwest::Client` is `Send + Sync` on every target
+    /// (including wasm32, where it is `Arc<Config>`); only its per-request
+    /// futures are `!Send` on wasm — those are wrapped via `send_compat`.
     client: reqwest::Client,
     /// Callback for incoming messages (uses std RwLock for synchronous access).
     callback: Arc<StdRwLock<Option<Box<TransportCallback>>>>,
+}
+
+/// Runs a `!Send` future (reqwest's wasm fetch future) so that the enclosing
+/// `#[async_trait]` method — whose returned future must be `Send` — still
+/// compiles on wasm32. On native, reqwest futures are already `Send`, so this
+/// is a zero-cost pass-through. On wasm32 the browser is single-threaded, so
+/// `SendWrapper` never trips its origin-thread guard.
+// NB: this is a plain `fn`, not an `async fn`. An `async fn` would capture `f`
+// (type `F`, `!Send` on wasm) in its initial generator state, making the whole
+// future `!Send` before it ever wraps `f`. Returning `SendWrapper<F>` directly
+// means the only thing the caller holds across `.await` is the (always-`Send`)
+// wrapper.
+#[cfg(target_arch = "wasm32")]
+fn send_compat<F: core::future::Future>(f: F) -> impl core::future::Future<Output = F::Output> {
+    send_wrapper::SendWrapper::new(f)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn send_compat<F: core::future::Future>(f: F) -> impl core::future::Future<Output = F::Output> {
+    f
 }
 
 impl std::fmt::Debug for SimplifiedFetchTransport {
@@ -493,7 +512,6 @@ impl SimplifiedFetchTransport {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            #[cfg(feature = "http")]
             client: reqwest::Client::new(),
             callback: Arc::new(StdRwLock::new(None)),
         }
@@ -505,7 +523,6 @@ impl SimplifiedFetchTransport {
     }
 
     /// Returns the auth endpoint URL.
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     fn auth_url(&self) -> String {
         format!("{}/.well-known/auth", self.base_url)
     }
@@ -577,7 +594,6 @@ impl SimplifiedFetchTransport {
     }
 
     /// Invokes the callback with a message.
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     async fn invoke_callback(&self, message: AuthMessage) -> Result<()> {
         // Get a future to execute from the callback (while holding lock briefly)
         let future_opt = {
@@ -599,43 +615,40 @@ impl SimplifiedFetchTransport {
 #[async_trait]
 impl Transport for SimplifiedFetchTransport {
     async fn send(&self, message: &AuthMessage) -> Result<()> {
-        #[cfg(not(feature = "http"))]
-        {
-            let _ = message;
-            return Err(Error::AuthError(
-                "HTTP transport requires the 'http' feature".into(),
-            ));
-        }
-
-        #[cfg(feature = "http")]
         {
             match message.message_type {
                 MessageType::InitialRequest
                 | MessageType::InitialResponse
                 | MessageType::CertificateRequest
                 | MessageType::CertificateResponse => {
-                    // Send as JSON POST to .well-known/auth
-                    let response = self
-                        .client
-                        .post(self.auth_url())
-                        .json(message)
-                        .send()
-                        .await
-                        .map_err(|e| Error::AuthError(format!("HTTP request failed: {}", e)))?;
+                    // Send as JSON POST to .well-known/auth. reqwest's wasm
+                    // response future is !Send, so do all I/O inside send_compat
+                    // and return only the owned (Send) response body string.
+                    let response_text = send_compat(async {
+                        let response = self
+                            .client
+                            .post(self.auth_url())
+                            .json(message)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Error::AuthError(format!("HTTP request failed: {}", e))
+                            })?;
 
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        let body = response.text().await.unwrap_or_default();
-                        return Err(Error::AuthError(format!(
-                            "Auth endpoint returned {}: {}",
-                            status, body
-                        )));
-                    }
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(Error::AuthError(format!(
+                                "Auth endpoint returned {}: {}",
+                                status, body
+                            )));
+                        }
 
-                    // Parse response as AuthMessage
-                    let response_text = response.text().await.map_err(|e| {
-                        Error::AuthError(format!("Failed to read auth response: {}", e))
-                    })?;
+                        response.text().await.map_err(|e| {
+                            Error::AuthError(format!("Failed to read auth response: {}", e))
+                        })
+                    })
+                    .await?;
 
                     let response_message: AuthMessage = serde_json::from_str(&response_text)
                         .map_err(|e| {
@@ -721,20 +734,32 @@ impl Transport for SimplifiedFetchTransport {
                         request_builder = request_builder.body(http_request.body.clone());
                     }
 
-                    // Send request
-                    let response = request_builder
-                        .send()
-                        .await
-                        .map_err(|e| Error::AuthError(format!("HTTP request failed: {}", e)))?;
-
-                    // Extract response headers and body
-                    let response_status = response.status().as_u16();
-                    let response_headers = response.headers().clone();
-                    let response_body = response
-                        .bytes()
-                        .await
-                        .map_err(|e| Error::AuthError(format!("Failed to read response: {}", e)))?
-                        .to_vec();
+                    // Send request. reqwest's wasm response future is !Send, so do
+                    // all response I/O inside send_compat and return only owned,
+                    // Send data (status + headers + body).
+                    let (response_status, response_headers, response_body): (
+                        u16,
+                        reqwest::header::HeaderMap,
+                        Vec<u8>,
+                    ) = send_compat(async move {
+                        let response = request_builder
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Error::AuthError(format!("HTTP request failed: {}", e))
+                            })?;
+                        let status = response.status().as_u16();
+                        let headers = response.headers().clone();
+                        let body = response
+                            .bytes()
+                            .await
+                            .map_err(|e| {
+                                Error::AuthError(format!("Failed to read response: {}", e))
+                            })?
+                            .to_vec();
+                        Ok::<_, Error>((status, headers, body))
+                    })
+                    .await?;
 
                     // Note: Auth headers on response are optional - not all servers return them
                     // The caller can verify response authenticity if headers are present

@@ -88,6 +88,11 @@ optional = true
 # `reveal_counterparty_key_linkage`'s revelation_time field.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1"
+# Makes reqwest's wasm fetch futures (which hold a !Send JsFuture) satisfy the
+# `Send` bound that `#[async_trait]` adds. The browser is single-threaded, so the
+# wrapped future is never polled off its origin thread. Used by `send_compat` in
+# auth/transports/http.rs. Native builds don't pull this (reqwest is Send there).
+send_wrapper = { version = "0.6", features = ["futures"] }
 
 [features]
 default = ["primitives", "script"]
@@ -98,7 +103,7 @@ wallet = ["transaction"]
 messages = ["wallet"]
 compat = ["primitives"]
 totp = ["primitives"]
-auth = ["wallet", "messages", "dep:tokio"]
+auth = ["wallet", "messages", "dep:tokio", "dep:reqwest"]
 overlay = ["wallet", "dep:tokio"]
 storage = ["overlay"]
 registry = ["overlay"]
